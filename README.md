@@ -1,32 +1,71 @@
 # datapipe
 
-`datapipe` is a C++20 command-line engine for processing CSV data in bounded chunks. It reads a
-typed stream of records, applies filters and projections, computes grouped aggregations, and writes
-deterministic CSV output. The same engine is also available through an optional Python module.
+[![CI](https://github.com/MadniAbdulWahab/cpp-data-processing-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/MadniAbdulWahab/cpp-data-processing-engine/actions/workflows/ci.yml)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)](https://en.cppreference.com/w/cpp/20)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-I built the project around a simple constraint: processing should not require loading the entire
-input file into memory. That decision shaped the parser, batch model, aggregation state, thread
-pool, and output ordering.
+A small C++20 engine for filtering, projecting, and aggregating CSV data without loading the whole
+file into memory.
 
-## What it does
+`datapipe` reads rows in bounded chunks, converts them to typed values, and sends independent
+batches through a reusable thread pool. The result is a command-line tool that handles real CSV,
+keeps memory use predictable, and produces the same ordering regardless of how worker threads are
+scheduled.
 
-- Reads CSV incrementally, including quoted fields, escaped quotes, embedded newlines, CRLF/LF,
-  empty values, and custom delimiters.
-- Infers a schema or validates data against an explicit schema.
-- Represents values as `int64`, `double`, `string`, `bool`, or null.
-- Filters with `==`, `!=`, `<`, `<=`, `>`, and `>=`.
-- Writes only the selected columns when projection is enabled.
-- Groups by one column and computes `count`, `sum`, `min`, `max`, and `mean`.
-- Processes configurable chunks on a reusable thread pool.
-- Preserves input order for projected rows and stable key order for grouped results.
-- Propagates parser, conversion, file, and worker-thread errors to the caller.
-- Refuses to overwrite the input file.
+## A quick example
 
-## Quick start
+Given a file of temperature readings:
 
-### Windows
+```csv
+id,region,temperature,active,note
+1,north,21.5,true,"clear, calm"
+2,south,18,false,"said ""cold"""
+3,north,24,true,
+4,east,20.5,false,cloudy
+5,south,,true,missing
+```
 
-The checked-in preset uses Visual Studio 2022 and works from regular PowerShell:
+this command keeps readings above 20 °C and calculates a summary per region:
+
+```sh
+datapipe readings.csv \
+  --filter "temperature > 20" \
+  --group-by region \
+  --aggregate "mean:temperature,count:*" \
+  --chunk-size 2 \
+  --threads 4 \
+  --output summary.csv
+```
+
+```csv
+region,mean_temperature,count
+east,20.5,1
+north,22.75,2
+```
+
+Even with two rows per chunk and four workers, grouped results are merged in a fixed order. A
+single-threaded run produces the same output.
+
+## What is included
+
+- Incremental CSV parsing with quoted fields, escaped quotes, embedded newlines, CRLF/LF endings,
+  custom delimiters, and UTF-8 BOM handling.
+- Schema inference plus explicit schemas with `int64`, `double`, `string`, `bool`, and nullable
+  fields.
+- Comparisons using `==`, `!=`, `<`, `<=`, `>`, and `>=`.
+- Column projection and grouped `count`, `sum`, `min`, `max`, and `mean` aggregations.
+- Configurable chunk sizes and worker counts with a bounded in-flight queue.
+- Stable output ordering and worker exceptions propagated back to the caller.
+- An optional Python module built with pybind11.
+- Dependency-free C++ tests, sanitizer builds, and a reproducible benchmark harness.
+
+## Build and run
+
+You need a C++20 compiler and CMake 3.20 or newer.
+
+### Windows (Visual Studio 2022)
+
+The checked-in CMake preset works from a regular PowerShell window:
 
 ```powershell
 cmake --preset windows-msvc
@@ -34,17 +73,13 @@ cmake --build --preset windows-msvc-release
 ctest --preset windows-msvc-release
 ```
 
-Run the included example:
+The executable will be at `build\windows-msvc\Release\datapipe.exe`:
 
 ```powershell
 .\build\windows-msvc\Release\datapipe.exe `
   .\tests\fixtures\basic.csv `
   --filter "temperature > 20" `
   --select "region,temperature" `
-  --group-by region `
-  --aggregate "mean:temperature,count:*" `
-  --chunk-size 2 `
-  --threads 4 `
   --output .\results.csv
 ```
 
@@ -58,170 +93,83 @@ ctest --test-dir build --output-on-failure
 ./build/datapipe tests/fixtures/basic.csv \
   --filter "temperature > 20" \
   --select "region,temperature" \
-  --group-by region \
-  --aggregate "mean:temperature,count:*" \
-  --chunk-size 2 \
-  --threads 4 \
   --output results.csv
 ```
 
-The example reads five rows in three chunks and produces:
-
-```csv
-region,mean_temperature,count
-east,20.5,1
-north,22.75,2
-```
-
-## Why the implementation is structured this way
-
-CSV looks simple until parsing, typing, memory limits, and parallel execution meet. I kept those
-concerns separate so each part has a clear contract:
-
-```mermaid
-flowchart LR
-    A[CSV file] --> B[CsvReader]
-    B -->|typed RecordBatch| C[bounded task queue]
-    C --> D[filter / projection]
-    C --> E[partial aggregation]
-    D -->|submission order| F[CsvWriter]
-    E -->|ordered merge| G[final aggregation]
-    G --> F
-```
-
-### Typed boundary
-
-Raw strings are converted as they leave `CsvReader`. Downstream operations work with:
-
-```cpp
-using Value = std::variant<
-    std::monostate,
-    std::int64_t,
-    double,
-    std::string,
-    bool>;
-```
-
-`std::monostate` represents null. A `Schema` owns ordered `Field` definitions, and each field carries
-its name, type, and nullability. Conversion failures identify the logical row, column, expected
-type, and source value.
-
-### Ownership
-
-- `CsvReader` owns the input stream and parser state.
-- `RecordBatch` owns all rows in one chunk and is moved into a worker task.
-- `ThreadPool` owns every worker thread and joins them during shutdown.
-- `CsvWriter` owns the output stream and output schema.
-- There are no owning raw pointers or detached threads.
-
-The task wrapper uses `std::shared_ptr<std::packaged_task<...>>` because the queue stores
-`std::function<void()>`, which requires a copyable callable. The work itself still has one logical
-owner and one associated future.
-
-### Chunking and concurrency
-
-One thread reads the sequential CSV stream. Completed batches can then be processed independently.
-The pipeline keeps at most twice the worker count in flight, which prevents a fast reader from
-building an unbounded queue.
-
-Futures are consumed in submission order. This gives two useful guarantees:
-
-1. Filtered or projected rows keep their original input order.
-2. Partial aggregation states merge in a fixed order, independent of worker scheduling.
-
-Each aggregation has mergeable state. For example, `mean` stores a partial sum and count; division
-happens only after all chunks have been merged. A one-thread run and a multi-thread run therefore
-follow the same chunk merge order.
-
-More detail is available in [ARCHITECTURE.md](ARCHITECTURE.md).
-
-## CLI reference
+## Command-line options
 
 ```text
 datapipe INPUT.csv [options] --output OUTPUT.csv
 
 --filter EXPR          comparison such as "temperature >= 20"
 --select COLUMNS       comma-separated output columns
---group-by COLUMN      one grouping column
---aggregate SPECS      for example mean:value,count:*
---schema FIELDS        explicit name:type[?] fields
+--group-by COLUMN      group results by one column
+--aggregate SPECS      for example "mean:value,count:*"
+--schema FIELDS        explicit "name:type[?]" fields
 --delimiter CHAR       input and output delimiter
---null-value TEXT      additional input null marker and output spelling
---chunk-size N         rows per chunk; default 50000
---threads N            worker threads; default 1
+--null-value TEXT      extra input null marker and output spelling
+--chunk-size N         rows per chunk (default: 50000)
+--threads N            worker threads (default: 1)
 --output PATH          output CSV path
 ```
 
-Exit codes are stable: `0` for success, `2` for command-line errors, `3` for data or filesystem
-errors, and `4` for unexpected failures.
-
-### Explicit schemas
-
-By default, `datapipe` infers types from the first 1,000 data rows and then reopens the file for the
-real processing pass. An explicit schema avoids sampling and gives stricter validation:
+Type inference samples the first 1,000 data rows. For stricter validation—or to skip the sampling
+pass—provide the schema yourself:
 
 ```sh
-datapipe input.csv \
-  --schema "id:int,region:string,temperature:double?,active:bool" \
+datapipe readings.csv \
+  --schema "id:int,region:string,temperature:double?,active:bool,note:string?" \
   --output typed.csv
 ```
 
-The `?` suffix marks a nullable field. Supported type names are `int`, `double`, `string`, and
-`bool`.
+The `?` suffix makes a field nullable. Conversion errors include the row, column, expected type,
+and offending value, which makes bad input reasonably quick to track down.
 
-## CSV rules
+Exit codes are stable: `0` for success, `2` for invalid command-line arguments, `3` for data or
+filesystem errors, and `4` for unexpected failures.
 
-The first record is treated as the header. Column names must be non-empty and unique. With an
-explicit schema, header names and order must match the schema.
+## How the pipeline works
 
-Supported input behavior:
+```mermaid
+flowchart LR
+    A[CSV file] --> B[typed reader]
+    B -->|RecordBatch| C[bounded task queue]
+    C --> D[filter / projection]
+    C --> E[partial aggregation]
+    D -->|input order| F[CSV writer]
+    E -->|ordered merge| F
+```
 
-- quoted fields and doubled quote escaping (`""`);
-- delimiters and line breaks inside quoted fields;
-- LF and CRLF record endings;
-- a UTF-8 BOM on the first header field;
-- a final record without a newline;
-- empty fields and a configurable null marker;
-- a configurable single-character delimiter.
+CSV parsing stays on one thread because it owns a sequential stream. Once a batch has been parsed
+and typed, it is moved to a worker and can be processed independently. At most twice the worker
+count is kept in flight, so a fast reader cannot quietly turn the queue into an in-memory copy of
+the input file.
 
-Whitespace is preserved as data. A quote inside an unquoted field, text after a closing quote, an
-unterminated quote, or the wrong field count is reported as malformed input.
+Completed futures are consumed in submission order. That preserves source order for filtered and
+projected rows and gives partial aggregation states a deterministic merge order. `mean`, for
+example, carries a sum and count across chunks and performs division only after the final merge.
 
-A header-only file is a valid empty dataset. A zero-byte file is accepted only when an explicit
-schema supplies the missing column contract.
+The implementation uses RAII throughout: streams own their files, batches own their rows, and the
+thread pool owns and joins its workers. There are no detached threads or owning raw pointers.
 
-## Tests and verification
+For a closer look at ownership, error propagation, and aggregation state, see
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-The tests use a small dependency-free C++ harness and CTest. Coverage includes:
+## CSV behavior
 
-- schema construction and every supported value type;
-- invalid conversions and nullability failures;
-- quoted, escaped, multiline, malformed, and custom-delimiter CSV;
-- all six comparison operators;
-- projection and all five aggregations;
-- grouping and partial-state merging across chunks;
-- empty, header-only, single-row, and final-partial-chunk inputs;
-- thread-pool shutdown and worker exception propagation;
-- one-thread versus multi-thread output equivalence;
-- CLI success, validation failure, help, and input overwrite protection;
-- the Python binding when enabled.
+The first record is the header. Names must be non-empty and unique; when an explicit schema is
+provided, its names and order must match the header.
 
-Local verification completed for this revision:
+Whitespace is kept as data. Empty fields and a configurable marker can represent null. Malformed
+input—such as an unterminated quote, text after a closing quote, or the wrong number of fields—is
+reported instead of being silently repaired.
 
-| Configuration | Result |
-|---|---:|
-| MSVC 19.44, Debug | 5/5 CTest tests passed |
-| MSVC 19.44, Release | 5/5 CTest tests passed |
-| Clang 22.1.8, Debug | 5/5 CTest tests passed |
-| MSVC AddressSanitizer | 5/5 CTest tests passed |
-| Python 3.12 + pybind11 3.0.4 | 6/6 CTest tests passed |
-
-The GitHub Actions workflow builds and tests with GCC and Clang on Ubuntu. A separate Clang job
-runs AddressSanitizer and UndefinedBehaviorSanitizer.
+A header-only file is a valid empty dataset. A zero-byte file requires an explicit schema because
+there is no header from which to infer the columns.
 
 ## Python binding
 
-The binding is optional; the native library and CLI do not depend on pybind11.
+Python support is optional; the core library and CLI do not depend on pybind11.
 
 ```sh
 python -m pip install pybind11
@@ -232,57 +180,68 @@ cmake --build build-python --parallel
 ctest --test-dir build-python --output-on-failure
 ```
 
-The `datapipe_cpp` module exposes `Field`, `Schema`, `Filter`, `Aggregation`, `PipelineConfig`,
-`ProcessingResult`, and `process_csv`. The binding releases the GIL while C++ processes the file.
-See [examples/python_example.py](examples/python_example.py) for a complete call.
+```python
+from datapipe_cpp import PipelineConfig, parse_aggregations, parse_filter, process_csv
 
-## Benchmarking
+config = PipelineConfig()
+config.filter = parse_filter("temperature > 20")
+config.group_by = "region"
+config.aggregations = parse_aggregations("mean:temperature,count:*")
+config.threads = 4
 
-The repository includes a deterministic dataset generator and an end-to-end benchmark executable:
+result = process_csv("readings.csv", "summary.csv", config)
+print(f"read {result.input_rows} rows and wrote {result.output_rows}")
+```
+
+See [examples/python_example.py](examples/python_example.py) for the complete example.
+
+## Tests and benchmarks
+
+The test suite covers parsing edge cases, type conversion, every filter and aggregation, chunk
+boundaries, error propagation, CLI behavior, and equivalence between single- and multi-threaded
+runs. GitHub Actions builds the project with GCC and Clang and runs a separate AddressSanitizer and
+UndefinedBehaviorSanitizer job.
+
+To run the end-to-end benchmark on generated data:
 
 ```sh
 python tools/generate_dataset.py benchmark.csv --rows 1000000
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release --parallel
-./build-release/datapipe_benchmark benchmark.csv 3 > benchmark-results.csv
+./build-release/datapipe_benchmark benchmark.csv 3
 ```
 
-The timed section includes schema inference, parsing, processing, output, and flush. It covers
-filtering, filtering with projection, grouped aggregation, two chunk sizes, and one versus all
-available hardware threads.
+The timing includes inference, parsing, processing, output, and flush. One recorded local run,
+including machine details and the limits of the measurement, is in [BENCHMARKS.md](BENCHMARKS.md).
 
-I kept the raw results from one 100,000-row Windows run in [BENCHMARKS.md](BENCHMARKS.md), together
-with the machine details and measurement limitations. The main result was practical rather than
-headline-worthy: small chunks benefited from multiple workers, while two 50,000-row chunks could
-not keep twelve workers busy.
-
-## Repository layout
+## Project layout
 
 ```text
 include/datapipe/   public C++ headers
-src/                core implementation
-app/                command-line entry point
-tests/              unit/integration tests and fixtures
+src/                parser and pipeline implementation
+app/                command-line application
+tests/              unit and integration tests
 benchmarks/         benchmark executable
 tools/              deterministic dataset generator
 python/             pybind11 module
-examples/           Python usage example
-.github/workflows/  Linux CI
+examples/           Python example
 ```
 
-## Current limits
+## Current scope
 
-- Filters contain one comparison; there is no boolean expression tree yet.
-- Grouping supports one column.
-- Schema inference requires a seekable file because the sample is read twice.
-- Grouped aggregation memory grows with the number of distinct keys.
-- Floating-point sums use ordinary addition rather than compensated summation.
-- Output is written directly, so an I/O failure can leave a partial output file.
-- There is no stdin reader, join, sort, or automatic delimiter detection.
+The project deliberately keeps the query model small. Filters contain one comparison, grouping
+uses one column, and grouped aggregation keeps state for every distinct key. There is no join,
+sort, stdin reader, automatic delimiter detection, or compound boolean expression yet. Output is
+written directly, so a disk or I/O failure can leave a partial output file.
 
-The next changes I would make are compound filter expressions, multiple grouping keys, compensated
-sums, and atomic output replacement.
+These are the next areas worth extending; the batch boundary itself does not need to change to
+support them.
+
+## Contributing
+
+Build instructions, formatting rules, sanitizer configuration, and the pull-request checklist are
+in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-This project is available under the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE).
