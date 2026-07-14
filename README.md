@@ -1,18 +1,23 @@
-# datapipe
+# DataPipe
 
 [![CI](https://github.com/MadniAbdulWahab/cpp-data-processing-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/MadniAbdulWahab/cpp-data-processing-engine/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)](https://en.cppreference.com/w/cpp/20)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A small C++20 engine for filtering, projecting, and aggregating CSV data without loading the whole
-file into memory.
+**A typed, chunked CSV processing engine written in C++20.**
 
-`datapipe` reads rows in bounded chunks, converts them to typed values, and sends independent
-batches through a reusable thread pool. The result is a command-line tool that handles real CSV,
-keeps memory use predictable, and produces the same ordering regardless of how worker threads are
-scheduled.
+I built DataPipe around one constraint: processing a CSV file should not require holding the whole
+file in memory. It reads and types rows in chunks, sends independent batches through a reusable
+thread pool, and merges the results in a deterministic order.
 
-## A quick example
+The project is called **DataPipe**. The executable, C++ namespace, and Python module use lowercase
+names: `datapipe` and `datapipe_cpp`.
+
+[Quick example](#quick-example) · [Build](#build-and-run) · [CLI](#command-line-reference) ·
+[C++ library](#using-the-c-library) · [Design](#how-the-pipeline-works) ·
+[Python](#python-binding) · [Benchmarks](#tests-and-benchmarks)
+
+## Quick example
 
 Given a file of temperature readings:
 
@@ -25,7 +30,8 @@ id,region,temperature,active,note
 5,south,,true,missing
 ```
 
-this command keeps readings above 20 °C and calculates a summary per region:
+Once `datapipe` has been built, this command keeps readings above 20 °C and calculates a summary
+per region:
 
 ```sh
 datapipe readings.csv \
@@ -43,21 +49,20 @@ east,20.5,1
 north,22.75,2
 ```
 
-Even with two rows per chunk and four workers, grouped results are merged in a fixed order. A
-single-threaded run produces the same output.
+Here the five input rows are split across three chunks. Grouped results are still merged in a fixed
+order, and a single-threaded run produces the same output.
 
 ## What is included
 
-- Incremental CSV parsing with quoted fields, escaped quotes, embedded newlines, CRLF/LF endings,
-  custom delimiters, and UTF-8 BOM handling.
+- Incremental CSV parsing, including quoted fields, escaped quotes, embedded newlines, custom
+  delimiters, and UTF-8 BOM handling.
 - Schema inference plus explicit schemas with `int64`, `double`, `string`, `bool`, and nullable
   fields.
 - Comparisons using `==`, `!=`, `<`, `<=`, `>`, and `>=`.
 - Column projection and grouped `count`, `sum`, `min`, `max`, and `mean` aggregations.
-- Configurable chunk sizes and worker counts with a bounded in-flight queue.
-- Stable output ordering and worker exceptions propagated back to the caller.
-- An optional Python module built with pybind11.
-- Dependency-free C++ tests, sanitizer builds, and a reproducible benchmark harness.
+- Configurable chunk sizes and worker counts with a bounded in-flight queue and stable output.
+- Worker exceptions propagated back to the caller through futures.
+- Optional pybind11 bindings plus dependency-free C++ tests, sanitizers, and benchmarks.
 
 ## Build and run
 
@@ -96,7 +101,7 @@ ctest --test-dir build --output-on-failure
   --output results.csv
 ```
 
-## Command-line options
+## Command-line reference
 
 ```text
 datapipe INPUT.csv [options] --output OUTPUT.csv
@@ -128,6 +133,32 @@ and offending value, which makes bad input reasonably quick to track down.
 Exit codes are stable: `0` for success, `2` for invalid command-line arguments, `3` for data or
 filesystem errors, and `4` for unexpected failures.
 
+## Using the C++ library
+
+The CLI and Python module both call the same `datapipe::core` library. Until install and package
+export rules are added, another CMake project can include it directly:
+
+```cmake
+add_subdirectory(path/to/cpp-data-processing-engine)
+target_link_libraries(my_app PRIVATE datapipe::core)
+```
+
+The public entry point takes paths and a value-type configuration:
+
+```cpp
+#include <datapipe/pipeline.hpp>
+#include <utility>
+
+datapipe::PipelineConfig config;
+config.filter = datapipe::parse_filter("temperature > 20");
+config.select = {"region", "temperature"};
+config.chunk_size = 50'000;
+config.threads = 4;
+
+const auto result =
+    datapipe::process_csv("readings.csv", "warm-readings.csv", std::move(config));
+```
+
 ## How the pipeline works
 
 ```mermaid
@@ -140,17 +171,16 @@ flowchart LR
     E -->|ordered merge| F
 ```
 
-CSV parsing stays on one thread because it owns a sequential stream. Once a batch has been parsed
-and typed, it is moved to a worker and can be processed independently. At most twice the worker
-count is kept in flight, so a fast reader cannot quietly turn the queue into an in-memory copy of
-the input file.
+CSV parsing stays on one thread because it owns a sequential stream. Once a batch is parsed and
+typed, it is moved to a worker. At most twice the worker count is kept in flight, so filtering and
+projection do not quietly accumulate the complete input in memory.
 
 Completed futures are consumed in submission order. That preserves source order for filtered and
 projected rows and gives partial aggregation states a deterministic merge order. `mean`, for
 example, carries a sum and count across chunks and performs division only after the final merge.
 
-The implementation uses RAII throughout: streams own their files, batches own their rows, and the
-thread pool owns and joins its workers. There are no detached threads or owning raw pointers.
+Streams own their files, batches own their rows, and the thread pool owns and joins its workers.
+There are no detached threads or owning raw pointers.
 
 For a closer look at ownership, error propagation, and aggregation state, see
 [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -199,8 +229,8 @@ See [examples/python_example.py](examples/python_example.py) for the complete ex
 
 The test suite covers parsing edge cases, type conversion, every filter and aggregation, chunk
 boundaries, error propagation, CLI behavior, and equivalence between single- and multi-threaded
-runs. GitHub Actions builds the project with GCC and Clang and runs a separate AddressSanitizer and
-UndefinedBehaviorSanitizer job.
+runs. GitHub Actions builds with GCC and Clang and runs AddressSanitizer and
+UndefinedBehaviorSanitizer separately.
 
 To run the end-to-end benchmark on generated data:
 
@@ -211,8 +241,17 @@ cmake --build build-release --parallel
 ./build-release/datapipe_benchmark benchmark.csv 3
 ```
 
-The timing includes inference, parsing, processing, output, and flush. One recorded local run,
-including machine details and the limits of the measurement, is in [BENCHMARKS.md](BENCHMARKS.md).
+The benchmark is end to end: schema inference, parsing, processing, output, and flush are all
+timed. In one recorded 100,000-row Windows run, grouped aggregation with 1,000-row chunks produced
+these raw durations:
+
+| Threads | Run 1 | Run 2 |
+|---:|---:|---:|
+| 1 | 341 ms | 317 ms |
+| 12 | 244 ms | 216 ms |
+
+This is a local engineering observation, not a general throughput claim. The complete results,
+machine details, and measurement limitations are in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Project layout
 
@@ -229,10 +268,10 @@ examples/           Python example
 
 ## Current scope
 
-The project deliberately keeps the query model small. Filters contain one comparison, grouping
-uses one column, and grouped aggregation keeps state for every distinct key. There is no join,
-sort, stdin reader, automatic delimiter detection, or compound boolean expression yet. Output is
-written directly, so a disk or I/O failure can leave a partial output file.
+The query model is deliberately small. Filters contain one comparison, grouping uses one column,
+and grouped aggregation keeps state for every distinct key—so its memory use grows with group
+cardinality. There is no join, sort, stdin reader, automatic delimiter detection, or compound
+boolean expression yet. Output is written directly, so an I/O failure can leave a partial file.
 
 These are the next areas worth extending; the batch boundary itself does not need to change to
 support them.
