@@ -1,0 +1,13 @@
+/build*/
+/out/
+*.csv
+!tests/fixtures/*.csv
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.venv/
+.vs/
+.idea/
+.vscode/
+

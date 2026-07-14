@@ -1,0 +1,6 @@
+id,region,temperature,active,note
+1,north,21.5,true,"clear, calm"
+2,south,18,false,"said ""cold"""
+3,north,24,true,
+4,east,20.5,false,cloudy
+5,south,,true,missing
